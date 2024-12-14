@@ -1,5 +1,3 @@
-version: '3.7'
-
 services:
   prometheus:
     image: prom/prometheus
@@ -26,21 +24,31 @@ services:
       - "3000:3000"
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/anomaly_explainability.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
 
   anomaly_detection:
     build: .
+    depends_on: [prometheus, pushgateway, node_exporter]
     volumes:
       - ./data:/usr/src/app/data
     environment:
       - PROMETHEUS_URL=http://prometheus:9090
       - PROMETHEUS_PUSHGATEWAY_URL=http://pushgateway:9091
-      - TRAIN_DURATION=300  # Training duration set to 6 hours
+      - TRAIN_DURATION=300          # seconds of normal load to train on
       - HISTORICAL_DATA_PATH=/usr/src/app/data/historical_data.csv
-      - INCREMENTAL_TRAINING=false  # Disable incremental training
-      - HISTORICAL_TRAINING=false  # Disable historical training
+      - INCREMENTAL_TRAINING=false  # true = retrain even if a model exists
+      - HISTORICAL_TRAINING=false   # true = train from HISTORICAL_DATA_PATH instead of live data
 
   anomaly_induction:
     build: .
     command: ["python", "src/induce_anomalies.py"]
+    depends_on: [anomaly_detection]
+    volumes:
+      - ./data:/usr/src/app/data    # shares the model file and the anomaly schedule (labels)
     environment:
-      - TRAIN_DURATION=300  # Sync with the training duration
+      - ANOMALY_COUNT=6
+      - ANOMALY_GAP=60
+      - INDUCTION_WARMUP=60
