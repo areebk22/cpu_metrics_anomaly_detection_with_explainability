@@ -1,38 +1,71 @@
-import subprocess
-import random
+"""Induce labelled CPU anomalies after the model is trained.
+
+Load is generated with busy-loop worker processes inside this container, so no
+Docker CLI or TTY is needed. /proc/stat is not namespaced, so node_exporter
+sees the extra load. Each anomaly is written to the shared schedule file with
+its real start and end times, which gives the detector and the evaluation
+script ground-truth labels.
+"""
+import multiprocessing as mp
 import os
+import random
 import time
-from utils import schedule_anomalies
 
-# Get the TRAIN_DURATION from the environment variable (default: 21600 seconds = 6 hours)
-train_duration = int(os.getenv('TRAIN_DURATION', 300))
+import config
+from utils import now_str, record_anomaly, schedule_anomalies
 
-# Calculate total anomaly duration as 1% of the training duration
-total_anomaly_duration = int(train_duration * 0.01)
 
-# Define anomaly functions
-def induce_sustained_high_cpu(duration):
-    print(f"Inducing sustained high CPU usage for {duration} seconds...")
-    subprocess.run(["docker", "run", "--rm", "-it", "polinux/stress", "stress", "--cpu", "8", f"--timeout={duration}s"])
+def _burn(stop_at):
+    while time.time() < stop_at:
+        pass
 
-def induce_cpu_spike(duration):
-    print(f"Inducing CPU spike for {duration} seconds...")
-    subprocess.run(["docker", "run", "--rm", "-it", "polinux/stress", "stress", "--cpu", "8", f"--timeout={duration}s"])
 
-def induce_cpu_fluctuations(cycles, high_duration, low_duration):
-    print(f"Inducing CPU fluctuations: {cycles} cycles of {high_duration}s high load and {low_duration}s low load.")
-    for _ in range(cycles):
-        subprocess.run(["docker", "run", "--rm", "-it", "polinux/stress", "stress", "--cpu", "8", f"--timeout={high_duration}s"])
-        time.sleep(low_duration)
+def burn_cpu(duration, load_fraction=1.0):
+    workers = max(1, int(round((os.cpu_count() or 1) * load_fraction)))
+    stop_at = time.time() + duration
+    procs = [mp.Process(target=_burn, args=(stop_at,)) for _ in range(workers)]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join()
 
-# Generate a schedule of anomalies
-anomaly_schedule = schedule_anomalies(total_anomaly_duration)
 
-# Example usage: Execute the anomaly schedule
-for anomaly in anomaly_schedule:
-    if anomaly[0] == "sustained":
-        induce_sustained_high_cpu(anomaly[1])
-    elif anomaly[0] == "spike":
-        induce_cpu_spike(anomaly[1])
-    elif anomaly[0] == "fluctuations":
-        induce_cpu_fluctuations(anomaly[1], anomaly[2], anomaly[3])
+def run_anomaly(plan):
+    start = time.time()
+    if plan["type"] == "fluctuations":
+        print(f"[{now_str()}] Inducing fluctuations: {plan['cycles']} x ({plan['high']}s high / {plan['low']}s low)", flush=True)
+        for _ in range(plan["cycles"]):
+            burn_cpu(plan["high"], plan["load_fraction"])
+            time.sleep(plan["low"])
+    else:
+        print(f"[{now_str()}] Inducing {plan['type']} load for {plan['duration']}s "
+              f"on {plan['load_fraction']:.0%} of cores", flush=True)
+        burn_cpu(plan["duration"], plan["load_fraction"])
+    end = time.time()
+    record_anomaly({**plan, "start": start, "end": end,
+                    "start_str": now_str(start), "end_str": now_str(end)})
+
+
+def wait_for_model():
+    print(f"Waiting for the trained model at {config.MODEL_PATH} ...", flush=True)
+    while not config.MODEL_PATH.exists():
+        time.sleep(5)
+    print(f"Model found. Waiting {config.INDUCTION_WARMUP}s so the detector sees normal load first.", flush=True)
+    time.sleep(config.INDUCTION_WARMUP)
+
+
+def main():
+    if config.SCHEDULE_PATH.exists():
+        config.SCHEDULE_PATH.unlink()
+    wait_for_model()
+    plan = schedule_anomalies()
+    print("Anomaly plan: " + ", ".join(p["type"] for p in plan), flush=True)
+    for p in plan:
+        run_anomaly(p)
+        gap = config.ANOMALY_GAP + random.randint(0, 20)
+        time.sleep(gap)
+    print(f"All anomalies induced. Labels are in {config.SCHEDULE_PATH}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

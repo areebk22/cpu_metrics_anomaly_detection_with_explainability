@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+data/demo/
+data/explanations.jsonl
+data/*.tmp
